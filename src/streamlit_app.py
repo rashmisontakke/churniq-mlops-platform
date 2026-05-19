@@ -34,7 +34,7 @@ html, body, [class*="css"] {
 /* Hide Streamlit branding */
 #MainMenu {visibility: hidden;}
 footer {visibility: hidden;}
-header {visibility: hidden;}
+
 
 /* Main background */
 .stApp {
