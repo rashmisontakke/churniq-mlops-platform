@@ -47,6 +47,11 @@ header {visibility: hidden;}
     border-right: 1px solid #1e1e2e;
 }
 
+section[data-testid="stSidebar"] {
+    min-width: 320px !important;
+    max-width: 320px !important;
+}
+
 [data-testid="stSidebar"] * {
     color: #a0a0b8 !important;
 }
