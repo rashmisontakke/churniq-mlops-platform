@@ -1,0 +1,53 @@
+name: 🧪 Continuous Integration
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    name: 🧪 Test Pipeline
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 🏃‍♂️ Run training pipeline
+        run: |
+          python src/train.py
+
+      - name: 🔍 Run tests
+        run: |
+          pytest tests/ -v
+
+      - name: 🧪 Test Lambda handler locally
+        run: |
+          python lambda_handler.py
+
+      - name: 📊 Check model artifacts
+        run: |
+          ls -la models/
+          echo "✅ Model artifacts created successfully"
+
+      - name: 🐳 Test Docker build (Lambda - Primary)
+        run: |
+          docker build -t churn-model-lambda .
+          echo "✅ Lambda Docker image built successfully"
+
+      - name: 🐳 Test Docker build (FastAPI - Alternative)
+        run: |
+          docker build -f Dockerfile.fastapi -t churn-model-fastapi .
+          echo "✅ FastAPI Docker image built successfully" 

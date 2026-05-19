@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Model artifacts (too large for git)
+models/pipeline.pkl
+models/explainer.pkl
+models/feature_names.pkl
+models/latest_metrics.json
+models/shap_summary.png
+
+# Keep these in git (needed for Lambda)
+!models/model.pkl
+!models/model_columns.pkl
+
+# MLflow
+mlruns/
+mlflow.db
+
+# Environment variables
+.env
+.env.*
+*.env
+
+# Reports (generated)
+reports/
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temp
+*.tmp
+*.temp

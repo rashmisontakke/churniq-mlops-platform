@@ -1,0 +1,543 @@
+name: 🚀 Deploy ML Model to AWS Lambda with MLflow Registry
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'src/**'
+      - 'models/**'
+      - 'requirements.txt'
+      - 'Dockerfile*'
+      - '.github/workflows/deploy-lambda.yml'
+  workflow_dispatch:  # Allow manual triggers
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: churn-model-lambda
+  LAMBDA_FUNCTION_NAME: churn-model-predictor
+  MLFLOW_TRACKING_URI: sqlite:///mlruns.db  # Local SQLite for CI/CD
+  MODEL_NAME: ChurnModel
+  MIN_ACCURACY_FOR_PROMOTION: 0.82
+
+jobs:
+  test:
+    name: 🧪 Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 🏃‍♂️ Run training pipeline
+        run: |
+          python src/train.py
+
+      - name: 🔍 Run tests
+        run: |
+          pytest tests/ -v
+
+      - name: 🧪 Test Lambda handler locally
+        run: |
+          python scripts/test-lambda-local.py
+
+  model-training-and-registry:
+    name: 🤖 Enhanced Model Training & Registry
+    runs-on: ubuntu-latest
+    needs: test
+    outputs:
+      model-version: ${{ steps.model-training.outputs.model-version }}
+      model-promoted: ${{ steps.model-promotion.outputs.promoted }}
+      model-accuracy: ${{ steps.model-training.outputs.accuracy }}
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 📝 Create Enhanced Model Registry Module
+        run: |
+          cat > src/model_registry.py << 'EOF'
+          #!/usr/bin/env python3
+          """MLflow Model Registry Management for CI/CD"""
+          
+          import mlflow
+          from mlflow.tracking import MlflowClient
+          from mlflow.exceptions import MlflowException
+          import pandas as pd
+          from typing import Dict, Optional
+          import os
+          from datetime import datetime
+          
+          class ModelRegistryManager:
+              def __init__(self, model_name: str = "ChurnModel"):
+                  self.model_name = model_name
+                  self.client = MlflowClient()
+                  
+              def create_model_if_not_exists(self):
+                  try:
+                      self.client.get_registered_model(self.model_name)
+                      print(f"ℹ️  Model {self.model_name} already exists")
+                  except:
+                      self.client.create_registered_model(
+                          name=self.model_name,
+                          description="Bank Customer Churn Prediction Model - CI/CD"
+                      )
+                      print(f"✅ Created model {self.model_name} in registry")
+              
+              def register_model_with_stage(self, model_uri: str, stage: str = "Staging", 
+                                          description: str = None, tags: Dict = None) -> str:
+                  try:
+                      self.create_model_if_not_exists()
+                      
+                      model_version = self.client.create_model_version(
+                          name=self.model_name,
+                          source=model_uri,
+                          description=description or f"CI/CD Model - {datetime.now().isoformat()}"
+                      )
+                      
+                      version = model_version.version
+                      print(f"✅ Model registered: {self.model_name} version {version}")
+                      
+                      if tags:
+                          for key, value in tags.items():
+                              self.client.set_model_version_tag(self.model_name, version, key, value)
+                      
+                      if stage != "None":
+                          self.transition_model_stage(version, stage)
+                      
+                      return version
+                  except Exception as e:
+                      print(f"❌ Error registering model: {e}")
+                      raise e
+              
+              def transition_model_stage(self, version: str, stage: str, archive_existing: bool = True):
+                  if archive_existing and stage in ["Staging", "Production"]:
+                      existing_models = self.client.get_latest_versions(self.model_name, stages=[stage])
+                      for model in existing_models:
+                          self.client.transition_model_version_stage(
+                              name=self.model_name, version=model.version, stage="Archived"
+                          )
+                          print(f"📦 Archived {self.model_name} v{model.version} from {stage}")
+                  
+                  self.client.transition_model_version_stage(
+                      name=self.model_name, version=version, stage=stage
+                  )
+                  print(f"🚀 Model {self.model_name} v{version} transitioned to {stage}")
+              
+              def promote_to_production(self, staging_version: str = None, min_accuracy: float = 0.8) -> bool:
+                  if staging_version:
+                      staging_model = self.client.get_model_version(self.model_name, staging_version)
+                  else:
+                      staging_models = self.client.get_latest_versions(self.model_name, stages=["Staging"])
+                      if not staging_models:
+                          print("❌ No model found in Staging")
+                          return False
+                      staging_model = staging_models[0]
+                  
+                  run = self.client.get_run(staging_model.run_id)
+                  accuracy = run.data.metrics.get("accuracy", 0)
+                  
+                  if accuracy < min_accuracy:
+                      print(f"❌ Model accuracy {accuracy:.3f} below threshold {min_accuracy}")
+                      return False
+                  
+                  # Check if better than current production
+                  prod_models = self.client.get_latest_versions(self.model_name, stages=["Production"])
+                  if prod_models:
+                      prod_run = self.client.get_run(prod_models[0].run_id)
+                      prod_accuracy = prod_run.data.metrics.get("accuracy", 0)
+                      
+                      if accuracy <= prod_accuracy:
+                          print(f"❌ Staging model not better than production ({accuracy:.3f} <= {prod_accuracy:.3f})")
+                          return False
+                  
+                  print(f"🔍 Promoting {self.model_name} v{staging_model.version} to Production")
+                  print(f"📊 Model accuracy: {accuracy:.3f}")
+                  
+                  self.transition_model_stage(staging_model.version, "Production")
+                  print("🎉 Model successfully promoted to Production!")
+                  return True
+              
+              def get_model_info(self, stage: str = "Production") -> Optional[Dict]:
+                  try:
+                      latest_version = self.client.get_latest_versions(self.model_name, stages=[stage])
+                      if not latest_version:
+                          return None
+                      
+                      model_version = latest_version[0]
+                      run = self.client.get_run(model_version.run_id)
+                      
+                      return {
+                          "version": model_version.version,
+                          "stage": model_version.current_stage,
+                          "run_id": model_version.run_id,
+                          "model_uri": model_version.source,
+                          "metrics": run.data.metrics
+                      }
+                  except Exception as e:
+                      print(f"❌ Error getting model info: {e}")
+                      return None
+          EOF
+
+      - name: 🤖 Enhanced Model Training with Registry
+        id: model-training
+        run: |
+          cat > train_with_registry.py << 'EOF'
+          import pandas as pd
+          from sklearn.model_selection import train_test_split
+          from sklearn.linear_model import LogisticRegression
+          from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+          import mlflow
+          import mlflow.sklearn
+          import pickle
+          import os
+          import sys
+          sys.path.append('src')
+          from model_registry import ModelRegistryManager
+          from datetime import datetime
+          
+          # Load and preprocess data
+          df = pd.read_csv('data/Customer-Churn-Records.csv')
+          clean_features = [
+              'Geography', 'Gender', 'Age', 'CreditScore', 'Tenure', 
+              'Balance', 'EstimatedSalary', 'NumOfProducts', 'HasCrCard', 'IsActiveMember'
+          ]
+          
+          df = df.dropna()
+          X = df[clean_features]
+          y = df['Exited'].astype(int)
+          df_encoded = pd.get_dummies(X)
+          
+          X_train, X_test, y_train, y_test = train_test_split(df_encoded, y, test_size=0.2, random_state=42)
+          
+          # Train model
+          model = LogisticRegression(max_iter=1000)
+          model.fit(X_train, y_train)
+          
+          # Evaluate
+          y_pred = model.predict(X_test)
+          metrics = {
+              'accuracy': accuracy_score(y_test, y_pred),
+              'precision': precision_score(y_test, y_pred),
+              'recall': recall_score(y_test, y_pred),
+              'f1_score': f1_score(y_test, y_pred)
+          }
+          
+          print(f"📈 Model Performance:")
+          for metric, value in metrics.items():
+              print(f"  {metric}: {value:.4f}")
+          
+          # MLflow tracking
+          mlflow.set_experiment('churn-cicd')
+          
+          with mlflow.start_run() as run:
+              # Log parameters
+              mlflow.log_param("model_type", "LogisticRegression")
+              mlflow.log_param("deployment", "github-actions")
+              mlflow.log_param("commit_sha", os.getenv("GITHUB_SHA", "unknown"))
+              
+              # Log metrics
+              for metric, value in metrics.items():
+                  mlflow.log_metric(metric, value)
+              
+              # Log model
+              mlflow.sklearn.log_model(
+                  model, "model", input_example=X_test[:3]
+              )
+              
+              model_uri = f"runs:/{run.info.run_id}/model"
+              run_id = run.info.run_id
+          
+          # Registry management
+          registry = ModelRegistryManager()
+          
+          # Create CI/CD specific tags
+          tags = {
+              "ci_cd": "github-actions",
+              "commit_sha": os.getenv("GITHUB_SHA", "unknown"),
+              "training_date": datetime.now().isoformat(),
+              "accuracy": str(metrics['accuracy']),
+              "branch": os.getenv("GITHUB_REF_NAME", "unknown")
+          }
+          
+          description = f"CI/CD Model - Commit: {os.getenv('GITHUB_SHA', 'unknown')[:8]} - Accuracy: {metrics['accuracy']:.4f}"
+          
+          # Register in staging
+          version = registry.register_model_with_stage(
+              model_uri=model_uri,
+              stage="Staging",
+              description=description,
+              tags=tags
+          )
+          
+          # Save for local deployment (backup)
+          with open('models/model.pkl', 'wb') as f:
+              pickle.dump(model, f)
+          with open('models/model_columns.pkl', 'wb') as f:
+              pickle.dump(list(df_encoded.columns), f)
+          
+          # Output for GitHub Actions
+          print(f"::set-output name=model-version::{version}")
+          print(f"::set-output name=accuracy::{metrics['accuracy']:.4f}")
+          print(f"::set-output name=run-id::{run_id}")
+          
+          # Also write to GITHUB_OUTPUT for newer runner versions
+          if os.getenv('GITHUB_OUTPUT'):
+              with open(os.getenv('GITHUB_OUTPUT'), 'a') as f:
+                  f.write(f"model-version={version}\n")
+                  f.write(f"accuracy={metrics['accuracy']:.4f}\n")
+                  f.write(f"run-id={run_id}\n")
+          EOF
+          
+          # Run the enhanced training
+          python train_with_registry.py
+
+      - name: 🚀 Model Promotion to Production
+        id: model-promotion
+        env:
+          MIN_ACCURACY: ${{ env.MIN_ACCURACY_FOR_PROMOTION }}
+          MODEL_VERSION: ${{ steps.model-training.outputs.model-version }}
+        run: |
+          cat > promote_model.py << 'EOF'
+          import sys
+          import os
+          sys.path.append('src')
+          from model_registry import ModelRegistryManager
+          
+          registry = ModelRegistryManager()
+          
+          # Get environment variables
+          min_accuracy = float(os.getenv('MIN_ACCURACY', '0.82'))
+          model_version = os.getenv('MODEL_VERSION')
+          
+          print(f"🔍 Evaluating model v{model_version} for promotion...")
+          print(f"📊 Minimum accuracy threshold: {min_accuracy}")
+          
+          # Attempt promotion
+          promoted = registry.promote_to_production(
+              staging_version=model_version,
+              min_accuracy=min_accuracy
+          )
+          
+          # Output result
+          print(f"::set-output name=promoted::{str(promoted).lower()}")
+          
+          if os.getenv('GITHUB_OUTPUT'):
+              with open(os.getenv('GITHUB_OUTPUT'), 'a') as f:
+                  f.write(f"promoted={str(promoted).lower()}\n")
+          
+          # Display current registry status
+          print("\n📋 Current Model Registry Status:")
+          for stage in ["Staging", "Production"]:
+              info = registry.get_model_info(stage)
+              if info:
+                  print(f"  {stage}: v{info['version']} - Accuracy: {info['metrics']['accuracy']:.4f}")
+              else:
+                  print(f"  {stage}: No model")
+          EOF
+          
+          python promote_model.py
+
+      - name: 📊 Upload Model Artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: model-artifacts
+          path: |
+            models/
+            mlruns.db
+
+  build-and-deploy:
+    name: 🏗️ Build & Deploy to Lambda
+    runs-on: ubuntu-latest
+    needs: [test, model-training-and-registry]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 📥 Download Model Artifacts
+        uses: actions/download-artifact@v3
+        with:
+          name: model-artifacts
+
+      - name: 🔑 Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 🔐 Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: 🏗️ Build Docker image for Lambda
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          MODEL_VERSION: ${{ needs.model-training-and-registry.outputs.model-version }}
+          MODEL_PROMOTED: ${{ needs.model-training-and-registry.outputs.model-promoted }}
+        run: |
+          echo "🏷️ Building image with model version: $MODEL_VERSION"
+          echo "🚀 Model promoted to production: $MODEL_PROMOTED"
+          
+          # Build the Lambda-compatible Docker image
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            --build-arg MODEL_VERSION=$MODEL_VERSION \
+            --build-arg MODEL_PROMOTED=$MODEL_PROMOTED .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: 🚀 Push image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: 🎯 Create or Update Lambda function
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Check if Lambda function exists
+          if aws lambda get-function --function-name $LAMBDA_FUNCTION_NAME 2>/dev/null; then
+            echo "📝 Updating existing Lambda function..."
+            aws lambda update-function-code \
+              --function-name $LAMBDA_FUNCTION_NAME \
+              --image-uri $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+            
+            # Wait for update to complete
+            aws lambda wait function-updated \
+              --function-name $LAMBDA_FUNCTION_NAME
+          else
+            echo "🆕 Creating new Lambda function..."
+            
+            # Create execution role if it doesn't exist
+            ROLE_ARN=$(aws iam get-role --role-name lambda-execution-role --query 'Role.Arn' --output text 2>/dev/null || echo "")
+            
+            if [ -z "$ROLE_ARN" ]; then
+              echo "🔑 Creating Lambda execution role..."
+              aws iam create-role \
+                --role-name lambda-execution-role \
+                --assume-role-policy-document '{
+                  "Version": "2012-10-17",
+                  "Statement": [
+                    {
+                      "Effect": "Allow",
+                      "Principal": {
+                        "Service": "lambda.amazonaws.com"
+                      },
+                      "Action": "sts:AssumeRole"
+                    }
+                  ]
+                }'
+              
+              aws iam attach-role-policy \
+                --role-name lambda-execution-role \
+                --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+              
+              # Wait for role to be created
+              sleep 10
+              ROLE_ARN=$(aws iam get-role --role-name lambda-execution-role --query 'Role.Arn' --output text)
+            fi
+            
+            # Create Lambda function
+            aws lambda create-function \
+              --function-name $LAMBDA_FUNCTION_NAME \
+              --package-type Image \
+              --code ImageUri=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+              --role $ROLE_ARN \
+              --timeout 60 \
+              --memory-size 1024 \
+              --description "ML Churn Prediction Model deployed via GitHub Actions"
+          fi
+
+      - name: 🔧 Configure Lambda settings
+        env:
+          MODEL_VERSION: ${{ needs.model-training-and-registry.outputs.model-version }}
+          MODEL_PROMOTED: ${{ needs.model-training-and-registry.outputs.model-promoted }}
+        run: |
+          # Update function configuration with model metadata
+          aws lambda update-function-configuration \
+            --function-name $LAMBDA_FUNCTION_NAME \
+            --timeout 60 \
+            --memory-size 1024 \
+            --environment Variables='{
+              "MODEL_PATH": "/var/task/models/model.pkl",
+              "MODEL_COLUMNS_PATH": "/var/task/models/model_columns.pkl",
+              "MODEL_VERSION": "'$MODEL_VERSION'",
+              "MODEL_PROMOTED": "'$MODEL_PROMOTED'",
+              "DEPLOYMENT_SOURCE": "github-actions"
+            }'
+
+      - name: 🧪 Test Lambda function
+        run: |
+          echo "🔍 Testing Lambda function..."
+          aws lambda invoke \
+            --function-name $LAMBDA_FUNCTION_NAME \
+            --payload '{
+              "body": "{\"Geography\": \"France\", \"Gender\": \"Female\", \"Age\": 42, \"CreditScore\": 600, \"Tenure\": 3, \"Balance\": 0.0, \"EstimatedSalary\": 50000, \"NumOfProducts\": 1, \"HasCrCard\": 1, \"IsActiveMember\": 1}"
+            }' \
+            response.json
+          
+          echo "📋 Lambda response:"
+          cat response.json
+
+      - name: 📊 Final Deployment Summary
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+          MODEL_VERSION: ${{ needs.model-training-and-registry.outputs.model-version }}
+          MODEL_PROMOTED: ${{ needs.model-training-and-registry.outputs.model-promoted }}
+          MODEL_ACCURACY: ${{ needs.model-training-and-registry.outputs.model-accuracy }}
+        run: |
+          echo "🎉 =================================="
+          echo "🎉 DEPLOYMENT COMPLETED SUCCESSFULLY!"
+          echo "🎉 =================================="
+          echo ""
+          echo "📊 Model Information:"
+          echo "   📋 Model Version: $MODEL_VERSION"
+          echo "   📈 Model Accuracy: $MODEL_ACCURACY"
+          echo "   🚀 Promoted to Production: $MODEL_PROMOTED"
+          echo ""
+          echo "🐳 Infrastructure:"
+          echo "   📦 Docker Image: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          echo "   ⚡ Lambda Function: $LAMBDA_FUNCTION_NAME"
+          echo "   🌐 Region: $AWS_REGION"
+          echo ""
+          
+          # Get Lambda function URL if it exists
+          FUNCTION_URL=$(aws lambda get-function-url-config --function-name $LAMBDA_FUNCTION_NAME --query 'FunctionUrl' --output text 2>/dev/null || echo "Not configured")
+          echo "🔗 Function URL: $FUNCTION_URL"
+          echo ""
+          echo "✅ Ready for inference!" 
