@@ -13,12 +13,6 @@ venv/
 env/
 .venv/
 
-# Model artifacts (too large for git)
-models/pipeline.pkl
-models/explainer.pkl
-models/feature_names.pkl
-models/latest_metrics.json
-models/shap_summary.png
 
 # Keep these in git (needed for Lambda)
 !models/model.pkl
